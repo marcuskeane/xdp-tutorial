@@ -4,6 +4,9 @@
 #include <net/if.h>
 #include <linux/types.h>
 #include <stdbool.h>
+#include <arpa/inet.h>
+
+#define IP4_SIZE 15
 
 struct config {
 	__u32 xdp_flags;
@@ -20,6 +23,15 @@ struct config {
 	char progsec[32];
 	char src_mac[18];
 	char dest_mac[18];
+	char *local_addr;
+	char local_addr_buf[INET_ADDRSTRLEN];
+	char *global_addr;
+	char global_addr_buf[INET_ADDRSTRLEN];
+	char *vtep_ip;
+	char vtep_ip_buf[INET_ADDRSTRLEN];
+	int vni;
+	int vlan;
+	int lookup_ifindex;
 	__u16 xsk_bind_flags;
 	int xsk_if_queue;
 	bool xsk_poll_mode;

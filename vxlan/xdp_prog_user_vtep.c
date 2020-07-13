@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
-static const char *__doc__ = "XDP redirect helper\n"
-	" - Allows to populate/query tx_port and redirect_params maps\n";
+static const char *__doc__ = "XDP vtep helper\n"
+	" - Populates vtep  maps\n";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,17 +47,11 @@ static const struct option_wrapper long_options[] = {
 	{{"dev",         required_argument,	NULL, 'd' },
 	 "Operate on device <ifname>", "<ifname>", true},
 
-	{{"src-mac", required_argument, NULL, 'L' },
-	 "Local RMAC address to be translated", "<mac>", true },
+	{{"l-rmac", required_argument, NULL, 'L' },
+	 "Local RMAC address for L3 VNI", "<mac>", true },
 
-	{{"dest-mac", required_argument, NULL, 'R' },
-	 "MAC address of <ifname>", "<mac>", true },
-
-	{{"nat-laddr", required_argument, NULL, 'l' },
-	 "NAT inside local address", "<ipaddr>", true },
-
-	{{"nat-gaddr", required_argument, NULL, 'g' },
-	 "NAT inside global address", "<ipaddr>", true },
+	{{"r-mac", required_argument, NULL, 'R' },
+	 "Remote MAC address for L3 VNI", "<mac>", true },
 
 	{{"vtep-ip", required_argument, NULL, 'i' },
 	 "IP address of remote vtep", "<ipaddr>", true },
@@ -143,19 +137,25 @@ int main(int argc, char **argv)
 	char pin_dir[PATH_MAX];
 	unsigned char src[ETH_ALEN];
 	unsigned char dest[ETH_ALEN];
-	__u32 nat_laddr;
-	__u32 nat_gaddr;
+	__u32 vtep;
 	vtep_info vinfo = {};
 
 	struct config cfg = {
 		.ifindex   = -1,
+		.vni = -1
 	};
 
 	/* Cmdline options can change progsec */
 	parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
 
-	if (cfg.redirect_ifindex > 0 && cfg.ifindex == -1) {
+	if (cfg.ifindex == -1) {
 		fprintf(stderr, "ERR: required option --dev missing\n\n");
+		usage(argv[0], __doc__, long_options, (argc == 1));
+		return EXIT_FAIL_OPTION;
+	}
+
+	if (cfg.vni == -1) {
+		fprintf(stderr, "ERR: required option --vni missing\n\n");
 		usage(argv[0], __doc__, long_options, (argc == 1));
 		return EXIT_FAIL_OPTION;
 	}

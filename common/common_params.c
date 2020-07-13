@@ -92,7 +92,7 @@ void parse_cmdline_args(int argc, char **argv,
 	}
 
 	/* Parse commands line args */
-	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFUMQ:czpq",
+	while ((opt = getopt_long(argc, argv, "hd:r:L:R:ASNFUMQ:czpql:g:i:v:",
 				  long_options, &longindex)) != -1) {
 		switch (opt) {
 		case 'd':
@@ -182,6 +182,36 @@ void parse_cmdline_args(int argc, char **argv,
 		case 'z':
 			cfg->xsk_bind_flags &= XDP_COPY;
 			cfg->xsk_bind_flags |= XDP_ZEROCOPY;
+			break;
+		case 'l':
+			if (strlen(optarg) > INET_ADDRSTRLEN) {
+				fprintf(stderr, "ERR: --nat-laddr is too long\n");
+				goto error;
+			}
+			cfg->local_addr = (char *)&cfg->local_addr_buf;
+			strncpy(cfg->local_addr, optarg, INET_ADDRSTRLEN);
+			break;
+		case 'g':
+			if (strlen(optarg) > INET_ADDRSTRLEN) {
+				fprintf(stderr, "ERR: --nat-gaddr is too long\n");
+				goto error;
+			}
+			cfg->global_addr = (char *)&cfg->global_addr_buf;
+			strncpy(cfg->global_addr, optarg, INET_ADDRSTRLEN);
+			break;
+		case 'i':
+			if (strlen(optarg) > INET_ADDRSTRLEN) {
+				fprintf(stderr, "ERR: --vtep-ip is too long\n");
+				goto error;
+			}
+			cfg->vtep_ip = (char *)&cfg->vtep_ip_buf;
+			strncpy(cfg->vtep_ip, optarg, INET_ADDRSTRLEN);
+			break;
+		case 'v':
+			cfg->vni = atoi(optarg);
+			break;
+		case 'I':
+			cfg->lookup_ifindex = atoi(optarg);
 			break;
 		case 'h':
 			full_help = true;

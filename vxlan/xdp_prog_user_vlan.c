@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
-static const char *__doc__ = "XDP redirect helper\n"
-	" - Allows to populate/query tx_port and redirect_params maps\n";
+static const char *__doc__ = "XDP vtep helper\n"
+	" - Populates vtep  maps\n";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -47,23 +47,11 @@ static const struct option_wrapper long_options[] = {
 	{{"dev",         required_argument,	NULL, 'd' },
 	 "Operate on device <ifname>", "<ifname>", true},
 
-	{{"src-mac", required_argument, NULL, 'L' },
-	 "Local RMAC address to be translated", "<mac>", true },
+	{{"vlan", required_argument, NULL, 't' },
+	 "VLAN to lookup", "<vlan>", true },
 
-	{{"dest-mac", required_argument, NULL, 'R' },
-	 "MAC address of <ifname>", "<mac>", true },
-
-	{{"nat-laddr", required_argument, NULL, 'l' },
-	 "NAT inside local address", "<ipaddr>", true },
-
-	{{"nat-gaddr", required_argument, NULL, 'g' },
-	 "NAT inside global address", "<ipaddr>", true },
-
-	{{"vtep-ip", required_argument, NULL, 'i' },
-	 "IP address of remote vtep", "<ipaddr>", true },
-
-	{{"vni", required_argument, NULL, 'v' },
-	 "VXLAN VNI to use", "<ipaddr>", true },
+	{{"lookup-ifindex", required_argument, NULL, 'I' },
+	 "Ifindex to use for fib lookup", "<ifindex>", true },
 
 	{{"quiet",       no_argument,		NULL, 'q' },
 	 "Quiet mode (no output)"},
@@ -103,32 +91,22 @@ static int parse_mac(char *str, unsigned char mac[ETH_ALEN])
 	return 0;
 }
 
-static int write_iface_params(int map_fd, unsigned char *src, unsigned char *dest)
+static int write_vlan_map(int map_fd, int vlan, int lookup_ifindex)
 {
-	if (bpf_map_update_elem(map_fd, src, dest, 0) < 0) {
+	if (bpf_map_update_elem(map_fd, vlan, lookup_ifindex, 0) < 0) {
 		fprintf(stderr,
 			"WARN: Failed to update bpf map file: err(%d):%s\n",
 			errno, strerror(errno));
 		return -1;
 	}
 
-	printf("forward: %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x\n",
-			src[0], src[1], src[2], src[3], src[4], src[5],
-			dest[0], dest[1], dest[2], dest[3], dest[4], dest[5]
+	printf("new mapping: %d -> %d\n",
+			vlan, lookup_ifindex 
 	      );
 
 	return 0;
 }
 
-static int parse_ipstr(const char *ipstr, unsigned int *addr)
-{
-	if (inet_pton(AF_INET, ipstr, addr) == 1) {
-		return AF_INET;
-	}
-
-	fprintf(stderr, "%s is an invalid IP\n", ipstr);
-	return AF_UNSPEC;
-}
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -141,21 +119,30 @@ int main(int argc, char **argv)
 	int len;
 	int map_fd;
 	char pin_dir[PATH_MAX];
-	unsigned char src[ETH_ALEN];
-	unsigned char dest[ETH_ALEN];
-	__u32 nat_laddr;
-	__u32 nat_gaddr;
-	vtep_info vinfo = {};
 
 	struct config cfg = {
 		.ifindex   = -1,
+		.vlan = -1,
+		.lookup_ifindex = -1
 	};
 
 	/* Cmdline options can change progsec */
 	parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
 
-	if (cfg.redirect_ifindex > 0 && cfg.ifindex == -1) {
+	if (cfg.ifindex == -1) {
 		fprintf(stderr, "ERR: required option --dev missing\n\n");
+		usage(argv[0], __doc__, long_options, (argc == 1));
+		return EXIT_FAIL_OPTION;
+	}
+
+	if (cfg.vlan == -1) {
+		fprintf(stderr, "ERR: required option --vlan missing\n\n");
+		usage(argv[0], __doc__, long_options, (argc == 1));
+		return EXIT_FAIL_OPTION;
+	}
+
+	if (cfg.lookup_ifindex == -1) {
+		fprintf(stderr, "ERR: required option --lookup-ifindex missing\n\n");
 		usage(argv[0], __doc__, long_options, (argc == 1));
 		return EXIT_FAIL_OPTION;
 	}
@@ -166,26 +153,17 @@ int main(int argc, char **argv)
 		return EXIT_FAIL_OPTION;
 	}
 
-	if (parse_mac(cfg.src_mac, src) < 0) {
-		fprintf(stderr, "ERR: can't parse mac address %s\n", cfg.src_mac);
-		return EXIT_FAIL_OPTION;
-	}
-
-	if (parse_mac(cfg.dest_mac, dest) < 0) {
-		fprintf(stderr, "ERR: can't parse mac address %s\n", cfg.dest_mac);
-		return EXIT_FAIL_OPTION;
-	}
 
 	/* Open the tx_port map corresponding to the cfg.ifname interface */
-	map_fd = open_bpf_map_file(pin_dir, "mac_lookup", NULL);
+	map_fd = open_bpf_map_file(pin_dir, "vlan_lookup", NULL);
 	if (map_fd < 0) {
 		return EXIT_FAIL_BPF;
 	}
 
 	printf("map dir: %s\n", pin_dir);
 
-	/* Setup the mapping containing MAC addresses */
-	if (write_iface_params(map_fd, src, dest) < 0) {
+	/* Setup the mapping of vlan to lookup ifindex */
+	if (write_vlan_map(map_fd, src, dest) < 0) {
 		fprintf(stderr, "can't write iface params\n");
 		return 1;
 	}

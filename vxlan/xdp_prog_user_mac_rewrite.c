@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 
-static const char *__doc__ = "XDP redirect helper\n"
-	" - Allows to populate/query tx_port and redirect_params maps\n";
+static const char *__doc__ = "XDP mac rewrite helper\n"
+	" - Populates mac rewrite maps(rewrite rmac to physical)\n";
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,18 +53,6 @@ static const struct option_wrapper long_options[] = {
 	{{"dest-mac", required_argument, NULL, 'R' },
 	 "MAC address of <ifname>", "<mac>", true },
 
-	{{"nat-laddr", required_argument, NULL, 'l' },
-	 "NAT inside local address", "<ipaddr>", true },
-
-	{{"nat-gaddr", required_argument, NULL, 'g' },
-	 "NAT inside global address", "<ipaddr>", true },
-
-	{{"vtep-ip", required_argument, NULL, 'i' },
-	 "IP address of remote vtep", "<ipaddr>", true },
-
-	{{"vni", required_argument, NULL, 'v' },
-	 "VXLAN VNI to use", "<ipaddr>", true },
-
 	{{"quiet",       no_argument,		NULL, 'q' },
 	 "Quiet mode (no output)"},
 
@@ -103,7 +91,7 @@ static int parse_mac(char *str, unsigned char mac[ETH_ALEN])
 	return 0;
 }
 
-static int write_iface_params(int map_fd, unsigned char *src, unsigned char *dest)
+static int update_mac_lookup(int map_fd, unsigned char *src, unsigned char *dest)
 {
 	if (bpf_map_update_elem(map_fd, src, dest, 0) < 0) {
 		fprintf(stderr,
@@ -112,7 +100,7 @@ static int write_iface_params(int map_fd, unsigned char *src, unsigned char *des
 		return -1;
 	}
 
-	printf("forward: %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x\n",
+	printf("rewrite: %02x:%02x:%02x:%02x:%02x:%02x -> %02x:%02x:%02x:%02x:%02x:%02x\n",
 			src[0], src[1], src[2], src[3], src[4], src[5],
 			dest[0], dest[1], dest[2], dest[3], dest[4], dest[5]
 	      );
@@ -120,15 +108,6 @@ static int write_iface_params(int map_fd, unsigned char *src, unsigned char *des
 	return 0;
 }
 
-static int parse_ipstr(const char *ipstr, unsigned int *addr)
-{
-	if (inet_pton(AF_INET, ipstr, addr) == 1) {
-		return AF_INET;
-	}
-
-	fprintf(stderr, "%s is an invalid IP\n", ipstr);
-	return AF_UNSPEC;
-}
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -143,9 +122,6 @@ int main(int argc, char **argv)
 	char pin_dir[PATH_MAX];
 	unsigned char src[ETH_ALEN];
 	unsigned char dest[ETH_ALEN];
-	__u32 nat_laddr;
-	__u32 nat_gaddr;
-	vtep_info vinfo = {};
 
 	struct config cfg = {
 		.ifindex   = -1,
@@ -154,7 +130,7 @@ int main(int argc, char **argv)
 	/* Cmdline options can change progsec */
 	parse_cmdline_args(argc, argv, long_options, &cfg, __doc__);
 
-	if (cfg.redirect_ifindex > 0 && cfg.ifindex == -1) {
+	if (cfg.ifindex == -1) {
 		fprintf(stderr, "ERR: required option --dev missing\n\n");
 		usage(argv[0], __doc__, long_options, (argc == 1));
 		return EXIT_FAIL_OPTION;
@@ -185,7 +161,7 @@ int main(int argc, char **argv)
 	printf("map dir: %s\n", pin_dir);
 
 	/* Setup the mapping containing MAC addresses */
-	if (write_iface_params(map_fd, src, dest) < 0) {
+	if (update_mac_lookup(map_fd, src, dest) < 0) {
 		fprintf(stderr, "can't write iface params\n");
 		return 1;
 	}

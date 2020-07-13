@@ -4,7 +4,8 @@ XDP_TARGETS  := xdp_prog_kern_02 xdp_prog_kern_03
 XDP_TARGETS  += xdp_vlan01_kern
 XDP_TARGETS  += xdp_vlan02_kern
 XDP_TARGETS  += xdp_prog_kern_vxlan
-USER_TARGETS := xdp_prog_user
+USER_TARGETS := xdp_prog_user_nat
+USER_TARGETS += xdp_prog_user_mac_rewrite
 
 LIBBPF_DIR = ../libbpf/src/
 COMMON_DIR = ../common

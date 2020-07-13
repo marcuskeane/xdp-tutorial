@@ -33,6 +33,27 @@
 #define bpf_debug(fmt, ...) { } while (0)
 #endif
 
+#define IANA_VXLAN_UDP_PORT     4789
+#define MY_VNI 200
+#define DEST "10.254.12.2"
+
+#define VLAN_VID_MASK		0x0fff /* VLAN Identifier */
+#define VLAN_MAX_DEPTH 4
+
+
+#define IP4(a, b, c, d) (bpf_htonl((strtol((a), NULL, 10) << 24) | (strtol((b), NULL, 10) << 16) | (strtol((c), NULL, 10) << 8) | strtol((d), NULL, 10)))
+
+struct vtep_info {
+	__be32 vtep_ip;
+	__be32 vx_vni;
+	__u8 dest_rmac[ETH_ALEN];
+	__u8 src_rmac[ETH_ALEN];
+};
+
+struct vxlanhdr {
+	__be32 vx_flags;
+	__be32 vx_vni;
+};
 
 struct bpf_map_def SEC("maps") tx_port = {
 	.type = BPF_MAP_TYPE_DEVMAP,
@@ -48,35 +69,35 @@ struct bpf_map_def SEC("maps") mac_lookup = {
 	.max_entries = 1,
 };
 
+struct bpf_map_def SEC("maps") nat_inside_out = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(__u32),
+	.value_size = sizeof(__u32),
+	.max_entries = 5,
+};
 
-/*static __always_inline __u16 csum_fold_helper(__u32 csum)
-{
-	return ~((csum & 0xffff) + (csum >> 16));
-}
-*/
+struct bpf_map_def SEC("maps") nat_outside_in = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(__u32),
+	.value_size = sizeof(__u32),
+	.max_entries = 5,
+};
 
-/*
- * The icmp_checksum_diff function takes pointers to old and new structures and
- * the old checksum and returns the new checksum.  It uses the bpf_csum_diff
- * helper to compute the checksum difference. Note that the sizes passed to the
- * bpf_csum_diff helper should be multiples of 4, as it operates on 32-bit
- * words.
+struct bpf_map_def SEC("maps") vtep_lookup = {
+	.type = BPF_MAP_TYPE_HASH,
+	.key_size = sizeof(int),
+	.value_size = sizeof(struct vtep_info),
+	.max_entries = 1,
+};
+
+/* Based on parse_ethhdr() 
+ * returns vlan id.
+ * 0 for no vlan
+ * -1 on failue
  */
-/*static __always_inline __u16 icmp_checksum_diff(
-		__u16 seed,
-		struct icmphdr_common *icmphdr_new,
-		struct icmphdr_common *icmphdr_old)
-{
-	__u32 csum, size = sizeof(struct icmphdr_common);
 
-	csum = bpf_csum_diff((__be32 *)icmphdr_old, size, (__be32 *)icmphdr_new, size, seed);
-	return csum_fold_helper(csum);
-}
-*/
 
-//#define AF_INET 2
-//#define AF_INET6 10
-#define IPV6_FLOWINFO_MASK bpf_htonl(0x0FFFFFFF)
+
 
 /* from include/net/ip.h */
 static __always_inline int ip_decrease_ttl(struct iphdr *iph)
@@ -87,17 +108,6 @@ static __always_inline int ip_decrease_ttl(struct iphdr *iph)
 	return --iph->ttl;
 }
 
-
-#define IANA_VXLAN_UDP_PORT     4789
-#define MY_VNI 100
-#define DEST "10.254.12.2"
-
-#define IP4(a, b, c, d) ((strtol((a), NULL, 10) << 24) | (strtol((b), NULL, 10) << 16) | (strtol((c), NULL, 10) << 8) | strtol((d), NULL, 10))
-
-struct vxlanhdr {
-	__be32 vx_flags;
-	__be32 vx_vni;
-};
 
 /*
  * parse_vxlanhdr: parse the vxlan header and return the VNI
@@ -120,24 +130,21 @@ static __always_inline int parse_vxlanhdr(struct hdr_cursor *nh,
 }
 
 
-/* Solution to packet03/assignment-4 */
+/* SB */
 SEC("xdp_sb")
 int xdp_sb_func(struct xdp_md *ctx)
 {
 	void *data_end = (void *)(long)ctx->data_end;
 	void *data = (void *)(long)ctx->data;
-	struct bpf_fib_lookup fib_params = {};
+	//struct bpf_fib_lookup fib_params = {};
 	struct ethhdr *eth;
 	struct iphdr *iphdr;
 	struct udphdr *udphdr;
 	struct vxlanhdr *vxhdr;
-	int rc;
+	//int rc;
 	int action = XDP_PASS;
 	int eth_type, ip_type;
 	int vni;
-	//struct sockaddr_in sa_param;
-	//struct in_addr inaddr;
-	//char *ip_param = DEST;
 	__u32 csum = 0;
 	int i;
 	__u16 *next_iph_u16;
@@ -155,165 +162,302 @@ int xdp_sb_func(struct xdp_md *ctx)
 		goto out;
 	}
 
-	if (eth_type == bpf_htons(ETH_P_IP)) {
-		if ((ip_type = parse_iphdr(&nh, data_end, &iphdr)) < 0)
+	if (eth_type != bpf_htons(ETH_P_IP)) 
+		goto out;
+	if ((ip_type = parse_iphdr(&nh, data_end, &iphdr)) < 0)
+		goto out;
+
+	if (ip_type != IPPROTO_UDP) 
+		goto out;
+
+	if (parse_udphdr(&nh, data_end, &udphdr) < 0) {
+		action = XDP_ABORTED;
+		goto out;
+	}
+	if (udphdr->dest != bpf_htons(IANA_VXLAN_UDP_PORT)){
+		goto out;
+	}
+	if (parse_vxlanhdr(&nh, data_end, &vxhdr) < 0){
+		goto out;
+	}
+	vni = bpf_ntohl(vxhdr->vx_vni) >> 8;
+	bpf_debug("Debug:vni :0x%x\n", vni);
+	bpf_debug("Debug:vni(nbo)  :0x%x\n", vxhdr->vx_vni);
+	bpf_debug("Debug:my vni :0x%x\n", MY_VNI);
+
+	if (vni != MY_VNI) {
+		bpf_debug("Debug: not my vni\n");
+		goto out;
+	}
+	eth_type = parse_ethhdr(&nh, data_end, &eth);
+	bpf_debug("Debug: eth_type :0x%x\n", eth_type);
+	if (eth_type < 0) {
+		action = XDP_ABORTED;
+		goto out;
+	}
+
+	if (eth_type != bpf_htons(ETH_P_IP)) 
+		goto out;
+	ip_type = parse_iphdr(&nh, data_end, &iphdr);
+		
+	__be32 ip = IP4("10", "254", "12", "2");
+	iphdr->daddr = ip;
+	bpf_debug("Debug:reset ip\n");
+	iphdr->check = 0;
+
+	next_iph_u16 = (__u16 *)iphdr;
+	#pragma clang loop unroll(full)
+	for (i = 0; i < sizeof(*iphdr) >> 1; i++)
+		csum += *next_iph_u16++;
+
+	iphdr->check = ~((csum & 0xffff) + (csum >> 16));
+
+	// pop vxlan header
+	vxlan_offset = (int)(sizeof(*eth) + sizeof(*iphdr) + sizeof(*udphdr) + sizeof(*vxhdr));
+	if (bpf_xdp_adjust_head(ctx, vxlan_offset)) {
+	       goto out;
+	}
+	data_end = (void *)(long)ctx->data_end;
+	eth = (void *)(long)ctx->data;
+	if (eth + 1 > data_end) {
+		action = XDP_ABORTED;
+		goto out;
+	}
+
+	nh.pos = eth;
+	
+	eth_type = parse_ethhdr(&nh, data_end, &eth);
+	bpf_debug("Debug:parsing eth\n");
+	if (eth_type < 0) {
+		bpf_debug("Debug:parsing eth failed\n");
+		action = XDP_ABORTED;
+		goto out;
+	}
+	bpf_debug("Debug:looking up mac\n");
+		bpf_debug("Debug: eth->h_dest(1): %x:%x:%x\n", eth->h_dest[0], eth->h_dest[1], eth->h_dest[2]);
+		bpf_debug("Debug: eth->h_dest(2): %x:%x:%x\n", eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
+	dst_mac = bpf_map_lookup_elem(&mac_lookup, eth->h_dest);
+	bpf_debug("Debug:looked up mac\n");
+	if (!dst_mac)
+		goto out;
+
+	if (dst_mac)
+		bpf_debug("Debug:found mac\n");
+		memcpy(eth->h_dest, dst_mac, ETH_ALEN);
+	
+	/*if (eth_type == bpf_htons(ETH_P_IP)) {
+		ip_type = parse_iphdr(&nh, data_end, &iphdr);
+		if (ip_type < 0)
 			goto out;
 	} else {
 		goto out;
 	}
+	
+	if (iphdr->ttl <= 1)
+		goto out;
+	*/	
+		
 
-	if (ip_type == IPPROTO_UDP) {
-		if (parse_udphdr(&nh, data_end, &udphdr) < 0) {
-			action = XDP_ABORTED;
-			goto out;
-		}
-		if (udphdr->dest != bpf_htons(IANA_VXLAN_UDP_PORT)){
-			goto out;
-		}
-		if (parse_vxlanhdr(&nh, data_end, &vxhdr) < 0){
-			goto out;
-		}
-		vni = bpf_ntohl(vxhdr->vx_vni) >> 8;
-		bpf_debug("Debug:vni :0x%x\n", vni);
-		bpf_debug("Debug:vni(nbo)  :0x%x\n", vxhdr->vx_vni);
-		bpf_debug("Debug:my vni :0x%x\n", MY_VNI);
 
-		if (vni != MY_VNI) {
-			goto out;
-		}
-		eth_type = parse_ethhdr(&nh, data_end, &eth);
-		if (eth_type < 0) {
-			action = XDP_ABORTED;
-			goto out;
-		}
 
-		if (eth_type == bpf_htons(ETH_P_IP)) {
-			ip_type = parse_iphdr(&nh, data_end, &iphdr);
-		} else {
+out:
+	return xdp_stats_record_action(ctx, action);
+}
+
+
+#define MY_VLAN 10
+#define REMOTE_VNI 200
+
+/* NB */
+SEC("xdp_nb")
+int xdp_nb_func(struct xdp_md *ctx)
+{
+	void *data_end = (void *)(long)ctx->data_end;
+	void *data = (void *)(long)ctx->data;
+	struct bpf_fib_lookup fib_params = {};
+	struct ethhdr *eth;
+	//struct vlan_hdr *vlh;
+	struct iphdr *iphdr;
+	struct udphdr *udphdr;
+	struct vxlanhdr *vxhdr;
+	//int rc;
+	int action = XDP_PASS;
+	int eth_type, ip_type;
+	//
+	//__u16 vlan;
+	__u16 payload_len;
+	struct ethhdr eth_cpy;
+
+
+	__be32 inside_addr = IP4("10", "254", "12", "2");
+	__be32 outside_addr = IP4("10", "20", "20", "2");
+	__be32 remote_vtep = IP4("192", "168", "90", "3");
+	__be32 save_source;
+	//__be32 local_vtep  = IP4("10", "200", "23", "2");
+	__be32 remote_ip = IP4("10", "254", "34", "3");
+	__u16 vni = 200;
+	char local_rmac[] = {0x52, 0x30, 0x94, 0x00, 0xaa, 0x3e};
+	//char remote_rmac[] = {0x82, 0x74, 0x9e, 0xbc, 0x73, 0x8f};
+	char remote_rmac[] = {0x82, 0x5d, 0xdf, 0xe5, 0x43, 0xbf};
+
+
+	__u32 csum = 0;;
+	int i;
+	int rc;
+	__u64 nh_off;
+
+	__u16 *next_iph_u16;
+
+	struct hdr_cursor nh;
+
+	nh.pos = data;
+
+	eth_type = parse_ethhdr(&nh, data_end, &eth);
+	bpf_debug("Debug: %0x\n", eth_type);
+	if (eth_type < 0) {
+		action = XDP_ABORTED;
+		goto out;
+	}
+	if (eth + 1 > data_end)
+		goto out;
+
+	/* First copy the original Ethernet header */
+	__builtin_memcpy(&eth_cpy, eth, sizeof(eth_cpy));
+
+	iphdr = nh.pos;
+	if (iphdr + 1 > data_end)
+		goto out;
+
+	if (eth_type != bpf_htons(ETH_P_IP))
+		goto out;
+
+	if ((ip_type = parse_iphdr(&nh, data_end, &iphdr)) < 0) {
+		action = XDP_ABORTED;
+		goto out;
+	}
+
+	if (iphdr->saddr != inside_addr || iphdr->daddr != remote_ip)
+		goto out;
+
+
+	bpf_debug("Debug: resetting ip\n");
+	save_source = iphdr->saddr;
+	iphdr->saddr = outside_addr;
+	payload_len = ntohs(iphdr->tot_len);
+	iphdr->check = 0;
+
+	next_iph_u16 = (__u16 *)iphdr;
+	#pragma clang loop unroll(full)
+	for (i = 0; i < sizeof(*iphdr) >> 1; i++)
+		csum += *next_iph_u16++;
+	iphdr->check = ~((csum & 0xffff) + (csum >> 16));
+
+	fib_params.family	= AF_INET;
+	fib_params.tos		= iphdr->tos;
+	fib_params.l4_protocol	= iphdr->protocol;
+	fib_params.sport	= 0;
+	fib_params.dport	= 0;
+	fib_params.tot_len	= bpf_ntohs(iphdr->tot_len);
+	fib_params.ipv4_src	= iphdr->saddr;
+	fib_params.ipv4_dst	= remote_vtep;
+	fib_params.ifindex = ctx->ingress_ifindex;
+
+	rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
+	bpf_debug("Debug: rc: 0x%x\n", rc);
+	switch (rc) {
+	case BPF_FIB_LKUP_RET_SUCCESS:         /* lookup successful */
+		if (eth_type == bpf_htons(ETH_P_IP))
+			ip_decrease_ttl(iphdr);
+
+		if (bpf_xdp_adjust_head(ctx, 0 - ((int)sizeof(*eth) + (int)sizeof(*iphdr) + (int)sizeof(*udphdr) + (int)sizeof(*vxhdr))))
+			return -1;
+		data_end = (void *)(long)ctx->data_end;
+		eth = (void *)(long)ctx->data;
+		nh.pos = eth;
+
+		if (eth + 1 > data_end)
+			return -1;
+
+		__builtin_memcpy(eth, &eth_cpy, sizeof(*eth));
+
+		nh_off = sizeof(*eth);
+		nh.pos += nh_off;
+
+		iphdr = nh.pos;
+		if (iphdr + 1 > data_end)
 			goto out;
-		}
-		__be32 ip = bpf_htonl(IP4("10", "254", "12", "2"));
-		//if ((rval = inet_pton(AF_INET, "10.254.12.2", &inaddr)) == 0) {
-			//
-			//goto out;
-		//}
-		iphdr->daddr = ip;
-		bpf_debug("Debug:reset ip\n");
+
+		iphdr->version = 4;
+		iphdr->ihl = sizeof(*iphdr) >> 2;
+		iphdr->frag_off =	0;
+		iphdr->protocol = IPPROTO_UDP;
 		iphdr->check = 0;
+		csum = 0;
+		iphdr->tos = 0;
+		iphdr->tot_len = htons(payload_len + sizeof(*iphdr) + sizeof(*udphdr) + sizeof(*vxhdr) + sizeof(*eth));
+		iphdr->daddr = remote_vtep;
+		iphdr->saddr = save_source;
+		iphdr->ttl = 8;
 
 		next_iph_u16 = (__u16 *)iphdr;
 		#pragma clang loop unroll(full)
 		for (i = 0; i < sizeof(*iphdr) >> 1; i++)
 			csum += *next_iph_u16++;
-
 		iphdr->check = ~((csum & 0xffff) + (csum >> 16));
 
-		// pop vxlan header
-		vxlan_offset = (int)(sizeof(*eth) + sizeof(*iphdr) + sizeof(*udphdr) + sizeof(*vxhdr));
-		if (bpf_xdp_adjust_head(ctx, vxlan_offset)) {
-			bpf_debug("Debug:did not adjust\n");
-		       goto out;
-		}
- 		data_end = (void *)(long)ctx->data_end;
-		eth = (void *)(long)ctx->data;
-		if (eth + 1 > data_end) {
-			action = XDP_ABORTED;
-			goto out;
-		}
+		nh_off = sizeof(*iphdr);
+		nh.pos += nh_off;
 
-		nh.pos = eth;
-		
-		eth_type = parse_ethhdr(&nh, data_end, &eth);
-		bpf_debug("Debug:parsing eth\n");
-		if (eth_type < 0) {
-			bpf_debug("Debug:parsing eth failed\n");
-			action = XDP_ABORTED;
-			goto out;
-		}
-		bpf_debug("Debug:looking up mac\n");
-			bpf_debug("Debug: eth->h_dest(1): %x:%x:%x\n", eth->h_dest[0], eth->h_dest[1], eth->h_dest[2]);
-			bpf_debug("Debug: eth->h_dest(2): %x:%x:%x\n", eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
-		dst_mac = bpf_map_lookup_elem(&mac_lookup, eth->h_dest);
-		bpf_debug("Debug:looked up mac\n");
-		if (!dst_mac)
+		udphdr = nh.pos;
+		if (udphdr + 1 > data_end)
 			goto out;
 
-		if (dst_mac)
-			bpf_debug("Debug:found mac\n");
-			memcpy(eth->h_dest, dst_mac, ETH_ALEN);
-		
-		/*if (eth_type == bpf_htons(ETH_P_IP)) {
-			ip_type = parse_iphdr(&nh, data_end, &iphdr);
-			if (ip_type < 0)
-				goto out;
-		} else {
+		udphdr->source = bpf_htons(5555);
+		udphdr->dest = bpf_htons(IANA_VXLAN_UDP_PORT);
+		udphdr->check = 0;
+		udphdr->len = bpf_htons(sizeof(*udphdr) +sizeof(*vxhdr) + sizeof(*eth) + payload_len) ;
+
+		nh_off = sizeof(*udphdr);
+		nh.pos += nh_off;
+		vxhdr = nh.pos;
+		if (vxhdr + 1 > data_end)
 			goto out;
-		}
 		
-		if (iphdr->ttl <= 1)
+		vxhdr->vx_flags = bpf_htonl(0x8 << 24);
+		vxhdr->vx_vni = bpf_htonl(vni << 8);
+		
+		nh_off = sizeof(*vxhdr);
+		nh.pos += nh_off;
+		eth = nh.pos;
+		if (eth + 1 > data_end)
 			goto out;
-		*/	
-		goto out;
-		bpf_debug("Debug: iphdr->daddr:0x%x\n", iphdr->daddr);
-		bpf_debug("Debug: iphdr->saddr:0x%x\n", iphdr->saddr);
-
-		fib_params.family	= AF_INET;
-		fib_params.tos		= iphdr->tos;
-		fib_params.l4_protocol	= iphdr->protocol;
-		fib_params.sport	= 0;
-		fib_params.dport	= 0;
-		fib_params.tot_len	= bpf_ntohs(iphdr->tot_len);
-		fib_params.ipv4_src	= iphdr->saddr;
-		fib_params.ipv4_dst	= iphdr->daddr;
-		
-		//bpf_debug("Debug: ctx->ingress_ifindex: 0x%x\n", ctx->ingress_ifindex);
-		fib_params.ifindex = ctx->ingress_ifindex;
-
-		rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), 0);
-		switch (rc) {
-		case BPF_FIB_LKUP_RET_SUCCESS:         /* lookup successful */
-			if (eth_type == bpf_htons(ETH_P_IP))
-				ip_decrease_ttl(iphdr);
 
 
-			bpf_debug("Debug: fib_params.ifindex: 0x%x\n", fib_params.ifindex);
-
-			bpf_debug("Debug: eth->h_dest(1): %x:%x:%x\n", eth->h_dest[0], eth->h_dest[1], eth->h_dest[2]);
-			bpf_debug("Debug: eth->h_dest(2): %x:%x:%x\n", eth->h_dest[3], eth->h_dest[4], eth->h_dest[5]);
-
-			bpf_debug("Debug: eth->h_source(1): %x:%x:%x\n", eth->h_source[0], eth->h_source[1], eth->h_source[2]);
-			bpf_debug("Debug: eth->h_source(2): %x:%x:%x\n", eth->h_source[3], eth->h_source[4], eth->h_source[5]);
-
-
-			bpf_debug("Debug: h_vlan_proto: %x\n", fib_params.h_vlan_proto);
-			bpf_debug("Debug: h_vlan_TCI: %x\n", fib_params.h_vlan_TCI);
-
-			//action = bpf_redirect_map(&tx_port, fib_params.ifindex, 0);
-
-			//if (vlan_tag_push(ctx, eth, 10) < 0) {
-			//	goto out;
-			//}
-			
-			break;
-
-		case BPF_FIB_LKUP_RET_BLACKHOLE:    /* dest is blackholed; can be dropped */
-		case BPF_FIB_LKUP_RET_UNREACHABLE:  /* dest is unreachable; can be dropped */
-		case BPF_FIB_LKUP_RET_PROHIBIT:     /* dest not allowed; can be dropped */
-			action = XDP_DROP;
-			break;
-		case BPF_FIB_LKUP_RET_NOT_FWDED:    /* packet is not forwarded */
-		case BPF_FIB_LKUP_RET_FWD_DISABLED: /* fwding is not enabled on ingress */
-		case BPF_FIB_LKUP_RET_UNSUPP_LWT:   /* fwd requires encapsulation */
-		case BPF_FIB_LKUP_RET_NO_NEIGH:     /* no neighbor entry for nh */
-		case BPF_FIB_LKUP_RET_FRAG_NEEDED:  /* fragmentation required to fwd */
-			/* PASS */
-			break;
-		}
-		
-		
-	} else {
-		goto out;
+		memcpy(eth->h_dest, remote_rmac, ETH_ALEN);
+		memcpy(eth->h_source, local_rmac, ETH_ALEN);
+		bpf_debug("Debug: fib_params.dmac(1): %x:%x:%x\n", fib_params.dmac[0], fib_params.dmac[1], fib_params.dmac[2]);
+		bpf_debug("Debug: fib_params.dmac(2): %x:%x:%x\n", fib_params.dmac[3], fib_params.dmac[4], fib_params.dmac[5]);
+		bpf_debug("Debug: fib_params.smac(1): %x:%x:%x\n", fib_params.smac[0], fib_params.smac[1], fib_params.smac[2]);
+		bpf_debug("Debug: fib_params.smac(2): %x:%x:%x\n", fib_params.smac[3], fib_params.smac[4], fib_params.smac[5]);
+		bpf_debug("Debug: fib_params.ipv4_dst: 0x%x\n", bpf_ntohl(fib_params.ipv4_dst));
+		break;
+	case BPF_FIB_LKUP_RET_BLACKHOLE:    /* dest is blackholed; can be dropped */
+	case BPF_FIB_LKUP_RET_UNREACHABLE:  /* dest is unreachable; can be dropped */
+	case BPF_FIB_LKUP_RET_PROHIBIT:     /* dest not allowed; can be dropped */
+		action = XDP_DROP;
+		break;
+	case BPF_FIB_LKUP_RET_NOT_FWDED:    /* packet is not forwarded */
+		bpf_debug("Debug: not forwarded\n");
+	case BPF_FIB_LKUP_RET_FWD_DISABLED: /* fwding is not enabled on ingress */
+		bpf_debug("Debug: forwarding disabled\n");
+	case BPF_FIB_LKUP_RET_UNSUPP_LWT:   /* fwd requires encapsulation */
+	case BPF_FIB_LKUP_RET_NO_NEIGH:     /* no neighbor entry for nh */
+		bpf_debug("Debug: no neigh\n");
+	case BPF_FIB_LKUP_RET_FRAG_NEEDED:  /* fragmentation required to fwd */
+		/* PASS */
+		break;
 	}
+
 
 
 
